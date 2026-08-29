@@ -1,0 +1,118 @@
+name: Kernel Build 40796
+
+permissions:
+  contents: write
+  actions: write
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.10'
+  KSU_COMMIT: '6c13a0695a1115e1000c998872b66f4ff5b2f11e'
+  TARGET_KSU_VERSION: '40796'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize build space
+        uses: AdityaGarg8/remove-unwanted-software@v5
+        with:
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          remove-large-packages: 'true'
+          remove-swapfile: 'true'
+          verbose: 'true'
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt update && sudo apt upgrade -y
+          sudo apt install -y ccache python3 git curl wget zip unzip
+          pip install PyYAML
+
+      - name: Configure ccache
+        run: |
+          mkdir -p ~/.cache/bazel
+          ccache --version
+          ccache --max-size=2G
+          ccache --set-config=compression=true
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: Restore ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: android14-6.1-138-ccache-${{ github.sha }}
+          restore-keys: |
+            android14-6.1-138-ccache-
+
+      - name: Patch builder to force KSU_VERSION 40796
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('.github/workflows/scripts/kernel_builder.py')
+          s = p.read_text()
+
+          needle = '''        if self.config.kernelsu_commit:\n            ksu_dir = self.work_dir / "KernelSU"\n            if ksu_dir.exists():\n                self._chdir(ksu_dir)\n                self._run_cmd(f"git checkout {self.config.kernelsu_commit}", check=False)\n                self._chdir(self.work_dir)\n'''
+
+          repl = '''        if self.config.kernelsu_commit:\n            ksu_dir = self.work_dir / "KernelSU"\n            if ksu_dir.exists():\n                self._chdir(ksu_dir)\n                self._run_cmd(f"git checkout {self.config.kernelsu_commit}", check=False)\n                self._chdir(self.work_dir)\n\n        # This workflow intentionally pins the userspace/kernel ABI to SukiSU 40796.\n        # The upstream Makefile computes KSU_VERSION from the current remote main\n        # commit count, so pinning an old builtin SHA alone still reports 40895.\n        ksu_makefile = self.work_dir / "KernelSU/kernel/Makefile"\n        if self.config.kernelsu_commit and ksu_makefile.exists():\n            content = ksu_makefile.read_text()\n            content = content.replace(\n                'KSU_VERSION     := $(if $(LOCAL_COUNT),$(shell expr $(VERSION_BASE) + $(LOCAL_COUNT) - $(VERSION_OFFSET)),13000)',\n                'KSU_VERSION     := 40796'\n            )\n            ksu_makefile.write_text(content)\n            logger.info("Forced SukiSU KSU_VERSION to 40796")\n'''
+
+          if needle not in s:
+              raise SystemExit('Unable to locate add_kernelsu() patch point')
+          p.write_text(s.replace(needle, repl, 1))
+          PY
+
+      - name: Build fixed kernel
+        run: |
+          cd ./.github/workflows/scripts
+          python3 build.py \
+            --android android14 \
+            --kernel 6.1 \
+            --sub-level 138 \
+            --os-patch 2025-06 \
+            --ksu-version 'Stable(标准)' \
+            --ksu-commit="$KSU_COMMIT" \
+            --no-release
+
+      - name: Verify KSU version
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAKEFILE=$(find /tmp/gki-build -path '*/KernelSU/kernel/Makefile' -print -quit)
+          if [[ -z "$MAKEFILE" ]]; then
+            echo 'KernelSU kernel/Makefile not found' >&2
+            exit 1
+          fi
+          grep -n 'KSU_VERSION[[:space:]]*:=' "$MAKEFILE" | head -n 5
+          if ! grep -Eq '^KSU_VERSION[[:space:]]*:=[[:space:]]*40796[[:space:]]*$' "$MAKEFILE"; then
+            echo 'KSU_VERSION is not pinned to 40796' >&2
+            exit 1
+          fi
+          echo 'Verified: KSU_VERSION=40796'
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts
+          find /tmp/gki-build -name '*.zip' -type f -exec cp {} artifacts/ \;
+          find /tmp/gki-build -name '*.img' -type f -exec cp {} artifacts/ \;
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-android14-6.1-138-sukisu-40796
+          path: artifacts/*
