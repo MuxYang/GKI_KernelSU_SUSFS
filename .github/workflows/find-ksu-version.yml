@@ -1,0 +1,124 @@
+name: Find SukiSU Commit by KSU_VERSION
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: '目标 KSU_VERSION，例如 40796'
+        required: true
+        default: '40796'
+        type: string
+      branch:
+        description: 'SukiSU 分支'
+        required: true
+        default: 'builtin'
+        type: string
+
+jobs:
+  find:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v6
+
+      - name: Clone SukiSU-Ultra with full history
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/SukiSU-Ultra/SukiSU-Ultra.git sukisu
+          cd sukisu
+          git fetch --prune --tags origin '+refs/heads/*:refs/remotes/origin/*'
+          git checkout -B "${{ inputs.branch }}" "origin/${{ inputs.branch }}"
+
+      - name: Locate commit for target KSU_VERSION
+        id: find
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sukisu
+
+          TARGET='${{ inputs.target_version }}'
+          BRANCH='${{ inputs.branch }}'
+
+          MAKEFILE='kernel/Makefile'
+          if [[ ! -f "$MAKEFILE" ]]; then
+            echo "kernel/Makefile not found" >&2
+            exit 1
+          fi
+
+          VERSION_BASE=$(sed -nE 's/^VERSION_BASE[[:space:]]*:=[[:space:]]*([0-9]+).*/\1/p' "$MAKEFILE" | head -n1)
+          VERSION_OFFSET=$(sed -nE 's/^VERSION_OFFSET[[:space:]]*:=[[:space:]]*([0-9]+).*/\1/p' "$MAKEFILE" | head -n1)
+
+          if [[ -z "$VERSION_BASE" || -z "$VERSION_OFFSET" ]]; then
+            echo "Failed to parse VERSION_BASE/VERSION_OFFSET from $MAKEFILE" >&2
+            exit 1
+          fi
+
+          REQUIRED_COUNT=$(( TARGET - VERSION_BASE + VERSION_OFFSET ))
+
+          echo "Target KSU_VERSION : $TARGET"
+          echo "VERSION_BASE       : $VERSION_BASE"
+          echo "VERSION_OFFSET     : $VERSION_OFFSET"
+          echo "Required rev count : $REQUIRED_COUNT"
+
+          if (( REQUIRED_COUNT <= 0 )); then
+            echo "Invalid required revision count: $REQUIRED_COUNT" >&2
+            exit 1
+          fi
+
+          TOTAL=$(git rev-list --count "origin/$BRANCH")
+          echo "Current branch count: $TOTAL"
+
+          if (( REQUIRED_COUNT > TOTAL )); then
+            echo "Target version is newer than current branch history" >&2
+            exit 1
+          fi
+
+          # rev-list 默认从新到旧；第 N 个从根开始的提交即 reverse 后的第 N 行。
+          COMMIT=$(git rev-list --reverse "origin/$BRANCH" | sed -n "${REQUIRED_COUNT}p")
+          if [[ -z "$COMMIT" ]]; then
+            echo "Unable to resolve commit at count $REQUIRED_COUNT" >&2
+            exit 1
+          fi
+
+          ACTUAL_COUNT=$(git rev-list --count "$COMMIT")
+          CALCULATED_VERSION=$(( VERSION_BASE + ACTUAL_COUNT - VERSION_OFFSET ))
+          SHORT_SHA=$(git rev-parse --short=8 "$COMMIT")
+          COMMIT_DATE=$(git show -s --format='%cI' "$COMMIT")
+          SUBJECT=$(git show -s --format='%s' "$COMMIT")
+
+          echo
+          echo '=== RESULT ==='
+          echo "Commit             : $COMMIT"
+          echo "Short SHA          : $SHORT_SHA"
+          echo "Commit date        : $COMMIT_DATE"
+          echo "Subject            : $SUBJECT"
+          echo "Actual rev count   : $ACTUAL_COUNT"
+          echo "Calculated version : $CALCULATED_VERSION"
+
+          if [[ "$CALCULATED_VERSION" != "$TARGET" ]]; then
+            echo "Verification failed: calculated version does not equal target" >&2
+            exit 1
+          fi
+
+          {
+            echo "commit=$COMMIT"
+            echo "short_sha=$SHORT_SHA"
+            echo "commit_date=$COMMIT_DATE"
+            echo "actual_count=$ACTUAL_COUNT"
+            echo "calculated_version=$CALCULATED_VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo '## SukiSU commit lookup result'
+            echo
+            echo '| Field | Value |'
+            echo '|---|---|'
+            echo "| Target KSU_VERSION | \`$TARGET\` |"
+            echo "| Branch | \`$BRANCH\` |"
+            echo "| Commit | \`$COMMIT\` |"
+            echo "| Short SHA | \`$SHORT_SHA\` |"
+            echo "| Commit date | \`$COMMIT_DATE\` |"
+            echo "| Revision count | \`$ACTUAL_COUNT\` |"
+            echo "| Verified KSU_VERSION | \`$CALCULATED_VERSION\` |"
+            echo
+            echo "**Subject:** $SUBJECT"
+          } >> "$GITHUB_STEP_SUMMARY"
